@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voice Agent v2 — Bob & Alice</title>
+    <meta
+      name="description"
+      content="Low-latency streaming voice assistant with Bob & Alice agents. Real-time transcription, streaming LLM responses, and barge-in support."
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🏠</text></svg>"
+    />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Header -->
+      <header id="header">
+        <div class="header-brand">
+          <div class="brand-icon">🏠</div>
+          <div>
+            <div class="brand-name">Voice Agent v2</div>
+            <div class="brand-tag">Bob & Alice · Streaming WebSocket</div>
+          </div>
+        </div>
+        <div class="header-status">
+          <div id="connection-status">
+            <div class="status-dot" id="status-dot"></div>
+            <span id="status-label">Connecting…</span>
+          </div>
+          <div id="latency-display">— ms</div>
+        </div>
+      </header>
+
+      <!-- Sidebar -->
+      <aside id="sidebar">
+        <div class="agent-section">
+          <h3>Agents</h3>
+
+          <!-- Bob Card -->
+          <div class="agent-card bob active" id="card-bob">
+            <div class="agent-header">
+              <div class="agent-avatar bob" id="avatar-bob">🧑‍💼</div>
+              <div class="agent-info">
+                <div class="agent-name">Bob</div>
+                <div class="agent-role">Intake &amp; Planning</div>
+              </div>
+              <span class="active-badge">Active</span>
+            </div>
+            <div class="agent-desc">
+              Friendly, concise. Gathers goals, budget, timeline and creates
+              action plans.
+            </div>
+            <button
+              class="agent-transfer-btn"
+              id="transfer-bob-btn"
+              onclick="sendTransfer('bob')"
+            >
+              ↩ Switch to Bob
+            </button>
+          </div>
+
+          <!-- Alice Card -->
+          <div
+            class="agent-card alice"
+            id="card-alice"
+            style="margin-top: 12px"
+          >
+            <div class="agent-header">
+              <div class="agent-avatar alice" id="avatar-alice">👩‍🔧</div>
+              <div class="agent-info">
+                <div class="agent-name">Alice</div>
+                <div class="agent-role">Specialist &amp; Risk</div>
+              </div>
+              <span class="active-badge">Active</span>
+            </div>
+            <div class="agent-desc">
+              Structured, technical. Handles permits, codes, sequencing, and
+              risk analysis.
+            </div>
+            <button
+              class="agent-transfer-btn"
+              id="transfer-alice-btn"
+              onclick="sendTransfer('alice')"
+            >
+              → Switch to Alice
+            </button>
+          </div>
+        </div>
+
+        <!-- State / Logs tabbed panel -->
+        <div class="state-section">
+          <div class="tab-bar">
+            <button class="tab-btn active" id="tab-state" onclick="switchTab('state')">📊 State</button>
+            <button class="tab-btn" id="tab-logs"  onclick="switchTab('logs')">🖥 Logs</button>
+            <button class="tab-clear" onclick="clearLogs()" title="Clear logs">✕</button>
+          </div>
+
+          <!-- State pane -->
+          <div id="pane-state" class="tab-pane active">
+            <div id="state-panel">
+              <div style="color:var(--text-muted);font-size:12px;font-style:italic">State updates as you talk…</div>
+            </div>
+          </div>
+
+          <!-- Logs pane -->
+          <div id="pane-logs" class="tab-pane hidden">
+            <div id="log-panel">
+              <div class="log-line log-info"><span class="log-ts">--:--:--</span><span class="log-badge INFO">INFO</span><span class="log-msg">Waiting for server logs…</span></div>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main Panel -->
+      <main id="main">
+        <!-- Main Tabs -->
+        <div class="main-tabs">
+          <button class="tab-btn active" id="main-tab-chat" onclick="switchMainTab('chat')">💬 Chat</button>
+          <button class="tab-btn" id="main-tab-visualizer" onclick="switchMainTab('visualizer')">📈 Live Sound</button>
+        </div>
+
+        <!-- Chat Pane -->
+        <div id="main-pane-chat" class="main-pane active">
+          <!-- Transcript -->
+          <div id="transcript-container">
+            <div id="transcript">
+              <!-- Turns injected here -->
+            </div>
+          </div>
+
+          <!-- Streaming response token display -->
+          <div id="streaming-response" class="hidden">
+            <span id="token-display"></span><span class="cursor"></span>
+          </div>
+        </div>
+
+        <!-- Visualizer Pane -->
+        <div id="main-pane-visualizer" class="main-pane hidden">
+          <!-- Waveform / VAD Bar -->
+          <div id="waveform-container">
+            <canvas id="waveform-canvas" width="0" height="50"></canvas>
+            <div class="waveform-meta">
+              <div id="vad-indicator">Idle</div>
+              <div id="rms-display">RMS: —</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Controls -->
+        <div id="controls">
+          <button class="control-btn" id="mic-btn" onclick="toggleMic()">
+            <span class="btn-icon" id="mic-icon">🎤</span>
+            <span id="mic-label">Start Session</span>
+          </button>
+          <button class="control-btn" id="end-btn" onclick="endSession()" style="display: none; background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.5); color: #fca5a5;">
+            <span class="btn-icon">⏹</span>
+            <span>End Session</span>
+          </button>
+        </div>
+
+        <!-- Text input fallback -->
+        <div id="text-input-row">
+          <input
+            id="text-input"
+            type="text"
+            placeholder="Or type a message and press Enter…"
+            autocomplete="off"
+          />
+          <button id="send-btn" onclick="sendText()">Send →</button>
+        </div>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

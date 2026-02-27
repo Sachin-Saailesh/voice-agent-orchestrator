@@ -1,55 +1,62 @@
 """
-Speech-to-Text (STT) Client
-Wrapper around OpenAI Whisper API
+STT Client
+Wraps OpenAI Whisper for speech-to-text transcription.
 """
 
-import os
-
 import io
-import openai
+import os
+import wave
+import logging
 from typing import Optional
+
+import openai
+
+log = logging.getLogger(__name__)
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+SAMPLE_WIDTH = 2  # 16-bit
+
+
+def _pcm_to_wav(pcm_bytes: bytes) -> bytes:
+    """Wrap raw 16-bit PCM in a WAV container for Whisper."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
 
 
 class STTClient:
-    """Speech-to-Text client using OpenAI Whisper"""
-    
+    """Synchronous Whisper STT wrapper."""
+
     def __init__(self):
-        self.client = None
         api_key = os.getenv("OPENAI_API_KEY")
-        if api_key:
-            try:
-                self.client = openai.OpenAI(api_key=api_key)
-                print("[STT] Client initialized (Whisper)")
-            except Exception as e:
-                print(f"[STT] Failed to initialize OpenAI: {e}")
-        else:
-           print("[STT] Warning: OPENAI_API_KEY not found. STT disabled.")
-            
+        self._client = openai.OpenAI(api_key=api_key) if api_key else None
+        if not self._client:
+            log.warning("OPENAI_API_KEY not set — STT disabled")
+
     def transcribe(self, audio_bytes: bytes, language: str = "en") -> Optional[str]:
         """
-        Transcribe audio bytes to text
+        Transcribe raw 16-bit PCM audio bytes.
+        Returns transcript text or None on failure.
         """
-        if not self.client:
+        if not self._client or not audio_bytes:
             return None
-
         try:
-            # Create a file-like object from bytes
-            audio_file = io.BytesIO(audio_bytes)
-            audio_file.name = "audio.wav"
-            
-            # Call Whisper API
-            response = self.client.audio.transcriptions.create(
+            wav_bytes = _pcm_to_wav(audio_bytes)
+            buf = io.BytesIO(wav_bytes)
+            buf.name = "audio.wav"
+            resp = self._client.audio.transcriptions.create(
                 model="whisper-1",
-                file=audio_file,
+                file=buf,
                 language=language,
-                response_format="text"
+                response_format="text",
             )
-            
-            return response.strip() if response else None
-                
+            text = resp.strip() if isinstance(resp, str) else ""
+            return text or None
         except Exception as e:
-            # print(f"[STT] Error: {e}") 
+            log.error("STT error: %s", e)
             return None
-
-
-

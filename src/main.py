@@ -1,272 +1,294 @@
 #!/usr/bin/env python3
 """
-Bob ↔ Alice Voice Assistant - Main Application
-Production-grade voice assistant with agent transfer
+Bob ↔ Alice Voice Assistant — Terminal CLI (V1)
+Continuous-listening mode: VAD detects end of speech automatically.
+Barge-in stops playback and checkpoints the partial response for context continuity.
+
+Usage:
+    python main.py           # voice mode
+    python main.py --text    # text mode (no microphone needed)
 """
 
 import os
+import re
 import sys
+import threading
 import time
+import queue
 import argparse
 from typing import Optional
 
-from audio import AudioManager
+import numpy as np
+import sounddevice as sd
+from dotenv import load_dotenv
+
+from audio import AudioManager, _SPEECH_THRESHOLD
 from stt import STTClient
 from tts import TTSClient
 from llm import LLMClient
 from agents import AgentManager
 from router import TransferRouter
 from state import ConversationState
-from dotenv import load_dotenv
 
 
 class VoiceAssistant:
-    """Main voice assistant orchestrator"""
-    
+    """Terminal voice assistant — continuous listening with barge-in support."""
+
     def __init__(self, text_mode: bool = False):
         self.text_mode = text_mode
         self.audio = AudioManager() if not text_mode else None
         self.stt = STTClient()
         self.tts = TTSClient()
-
         self.llm = LLMClient(
             default_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
-            temperature=float(os.getenv("LLM_TEMPERATURE", "0.7"))
+            temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
         )
-        self.agent_manager = AgentManager()
+        self.agents = AgentManager()
         self.router = TransferRouter()
         self.state = ConversationState()
-        self.circuit_breaker_failures = 0
+
+        # Barge-in state
+        self._barge_in = threading.Event()
+        self._partial: str = ""
+        self._barge_in_preroll: Optional[bytes] = None
+        self._pending_stop: Optional[threading.Event] = None
+        self._pending_listener: Optional[threading.Thread] = None
+
+        self.failures = 0
         self.max_failures = 3
-        
-    def log(self, message: str, level: str = "INFO"):
-        """Enhanced logging with timestamps"""
-        timestamp = time.strftime("%H:%M:%S")
-        print(f"[{timestamp}] [{level}] {message}")
-    
-    def get_user_input(self) -> Optional[str]:
-        """Get user input via voice or text"""
+
+    def log(self, msg: str, level: str = "INFO"):
+        print(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}")
+
+    # ── Input ─────────────────────────────────────────────────────────────────
+
+    def get_input(self) -> Optional[str]:
         if self.text_mode:
             try:
-                user_input = input("\n👤 You: ").strip()
-                return user_input if user_input else None
+                return input("\n👤 You: ").strip() or None
             except (EOFError, KeyboardInterrupt):
                 return None
-        else:
-            try:
-                self.log("🎤 Recording... (Press Ctrl+C when done)")
-                audio_data = self.audio.record()
-                
-                if audio_data is None:
-                    self.log("No audio recorded", "WARN")
-                    return None
-                
-                # STT with timing
-                stt_start = time.time()
-                transcript = self.stt.transcribe(audio_data)
-                stt_ms = int((time.time() - stt_start) * 1000)
-                
-                if transcript:
-                    self.log(f"📝 Transcript ({stt_ms}ms): {transcript}")
-                    return transcript
+
+        # Stop any lingering barge-in listener
+        if self._pending_stop:
+            self._pending_stop.set()
+        if self._pending_listener:
+            self._pending_listener.join(timeout=0.8)
+        self._pending_stop = None
+        self._pending_listener = None
+        self._barge_in.clear()
+
+        pre_roll = self._barge_in_preroll
+        self._barge_in_preroll = None
+
+        audio_data = self.audio.record_with_vad(pre_roll=pre_roll)
+        if audio_data is None:
+            return None
+
+        t0 = time.time()
+        transcript = self.stt.transcribe(audio_data)
+        ms = int((time.time() - t0) * 1000)
+        if transcript:
+            self.log(f"📝 ({ms}ms): {transcript}")
+            return transcript
+        self.log("Could not transcribe audio", "WARN")
+        return None
+
+    # ── Speech output with barge-in ───────────────────────────────────────────
+
+    def speak(self, text: str, agent: str) -> tuple[bool, str]:
+        """
+        Speak text sentence-by-sentence with pipelined TTS and real-time barge-in.
+        Returns (interrupted, unspoken_remainder).
+        """
+        if not text.strip() or self.text_mode:
+            return False, ""
+
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+        if not sentences:
+            return False, ""
+
+        # Pre-synthesize next sentence while current plays
+        synth_q: queue.Queue = queue.Queue(maxsize=2)
+
+        def _synthesize():
+            for i, s in enumerate(sentences):
+                if self._barge_in.is_set():
+                    break
+                try:
+                    audio = self.tts.synthesize(s, agent)
+                except Exception as e:
+                    self.log(f"TTS error: {e}", "ERROR")
+                    audio = None
+                synth_q.put((i, s, audio))
+            synth_q.put(None)
+
+        # Background mic listener for barge-in
+        _stop_listener = threading.Event()
+
+        def _listen_for_barge_in():
+            post_chunks: list[bytes] = []
+
+            def _cb(indata, _frames, _time, _status):
+                if not self._barge_in.is_set():
+                    rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768.0)
+                    if rms > _SPEECH_THRESHOLD:
+                        self.log("✋ Barge-in detected")
+                        self._barge_in.set()
+                        post_chunks.append(bytes(indata))
                 else:
-                    self.log("Could not transcribe audio", "WARN")
-                    return None
-                    
-            except KeyboardInterrupt:
-                self.log("\nRecording stopped by user")
-                return None
-            except Exception as e:
-                self.log(f"Audio input error: {e}", "ERROR")
-                return None
-    
-    def process_turn(self, user_transcript: str) -> bool:
-        """
-        Process a single conversation turn
-        Returns False if should exit
-        """
+                    post_chunks.append(bytes(indata))
+
+            try:
+                with sd.InputStream(samplerate=16000, channels=1, dtype="int16",
+                                    blocksize=1600, callback=_cb):
+                    while not _stop_listener.is_set():
+                        time.sleep(0.01)
+            except Exception:
+                pass
+
+            if post_chunks:
+                self._barge_in_preroll = b"".join(post_chunks)
+
+        self._barge_in.clear()
+        synth_thread = threading.Thread(target=_synthesize, daemon=True)
+        listener_thread = threading.Thread(target=_listen_for_barge_in, daemon=True)
+        synth_thread.start()
+        listener_thread.start()
+
+        spoken: list[str] = []
+        interrupted_at = len(sentences)
+
         try:
-            # Check for exit commands
-            if user_transcript.lower() in ['exit', 'quit', 'bye', 'goodbye']:
+            while True:
+                item = synth_q.get()
+                if item is None:
+                    break
+                i, sentence, audio = item
+                if self._barge_in.is_set():
+                    interrupted_at = i
+                    break
+                if audio:
+                    self.log(f"🔊 {agent.upper()} [{i+1}/{len(sentences)}]")
+                    self.audio.play(audio, interrupt_event=self._barge_in)
+                if self._barge_in.is_set():
+                    interrupted_at = i + 1
+                    break
+                spoken.append(sentence)
+        finally:
+            if self._barge_in.is_set():
+                self._pending_stop = _stop_listener
+                self._pending_listener = listener_thread
+            else:
+                _stop_listener.set()
+                listener_thread.join(timeout=0.5)
+
+        if self._barge_in.is_set():
+            return True, " ".join(sentences[interrupted_at:])
+        return False, ""
+
+    # ── Turn processing ───────────────────────────────────────────────────────
+
+    def process_turn(self, user_text: str) -> bool:
+        try:
+            if user_text.lower() in ("exit", "quit", "bye", "goodbye"):
                 return False
-            
-            # Check for transfer BEFORE calling LLM
-            transfer_detected = self.router.detect_transfer(user_transcript)
-            
-            if transfer_detected:
-                new_agent = transfer_detected['target_agent']
-                
-                # Capture current agent for handoff voice
-                from_agent = self.agent_manager.current_agent
-                
-                handoff_message = self.agent_manager.transfer_to(
-                    new_agent, 
-                    self.state
-                )
-                
-                self.log(f"🔄 Transferring to {new_agent.upper()}...")
-                
-                # Speak the handoff message using the FROM agent's voice
-                self.speak_response(handoff_message, agent_name=from_agent)
-                
-                # Update state with transfer
+
+            had_partial = bool(self._partial)
+            if had_partial:
                 self.state.add_turn(
-                    speaker="system",
-                    text=f"[Transferred to {new_agent}]"
+                    speaker=self.agents.current_agent,
+                    text=f"[INTERRUPTED — was saying: {self._partial}]",
                 )
-                
-                # Now get the new agent's greeting/continuation
-                llm_start = time.time()
-                agent_response = self.agent_manager.get_response(
-                    user_transcript,
-                    self.state,
-                    self.llm,
-                    is_transfer_continuation=True
-                )
-                llm_ms = int((time.time() - llm_start) * 1000)
-                
-                self.log(f"🤖 {self.agent_manager.current_agent.upper()} ({llm_ms}ms): {agent_response}")
-                
-                # Speak the continuation
-                self.speak_response(agent_response, agent_name=self.agent_manager.current_agent)
-                
-                # Update state
-                self.state.add_turn(
-                    speaker=self.agent_manager.current_agent,
-                    text=agent_response
-                )
-                self.state.update_from_turn(user_transcript, agent_response, self.llm)
-                
-                # Reset circuit breaker on success
-                self.circuit_breaker_failures = 0
-                return True
-            
-            # Normal turn (no transfer)
-            llm_start = time.time()
-            agent_response = self.agent_manager.get_response(
-                user_transcript,
-                self.state,
-                self.llm
-            )
-            llm_ms = int((time.time() - llm_start) * 1000)
-            
-            self.log(f"🤖 {self.agent_manager.current_agent.upper()} ({llm_ms}ms): {agent_response}")
-            
-            # Speak response
-            self.speak_response(agent_response, agent_name=self.agent_manager.current_agent)
-            
-            # Update state
-            self.state.add_turn(speaker="user", text=user_transcript)
-            self.state.add_turn(speaker=self.agent_manager.current_agent, text=agent_response)
-            # Update state with extracted details (using gpt-5-nano if available)
-            self.state.update_from_turn(user_transcript, agent_response, self.llm)
-            
-            # Reset circuit breaker on success
-            self.circuit_breaker_failures = 0
+                self.state.add_turn(speaker="user", text=f"[Interrupted, continuing: {user_text}]")
+                self._partial = ""
+            else:
+                self.state.add_turn(speaker="user", text=user_text)
+
+            # Transfer detection
+            transfer = self.router.detect_transfer(user_text)
+            if transfer:
+                target = transfer["target_agent"]
+                from_agent = self.agents.current_agent
+                handoff = self.agents.transfer_to(target, self.state)
+                self.log(f"🔄 Transfer → {target.upper()}")
+                interrupted, unspoken = self.speak(handoff, from_agent)
+                if interrupted:
+                    self._partial = unspoken
+                self.state.add_turn(speaker="system", text=f"[Transferred to {target}]")
+
+            # LLM response
+            messages = self.agents._build_messages(user_text, self.state, is_transfer=bool(transfer))
+            t0 = time.time()
+            response = self.llm.chat(messages, max_tokens=400, temperature=0.7)
+            ms = int((time.time() - t0) * 1000)
+
+            if not response:
+                response = "I'm having trouble processing that right now. Could you try again?"
+
+            self.log(f"🤖 {self.agents.current_agent.upper()} ({ms}ms): {response}")
+            interrupted, unspoken = self.speak(response, self.agents.current_agent)
+
+            if interrupted:
+                self._partial = unspoken
+                spoken = response.replace(unspoken, "").strip()
+                if spoken:
+                    self.state.add_turn(speaker=self.agents.current_agent, text=spoken)
+            else:
+                self.state.add_turn(speaker=self.agents.current_agent, text=response)
+
+            self.failures = 0
             return True
-            
+
         except Exception as e:
-            self.log(f"Turn processing error: {e}", "ERROR")
-            self.circuit_breaker_failures += 1
-            
-            if self.circuit_breaker_failures >= self.max_failures:
-                self.log("Circuit breaker triggered - too many failures", "ERROR")
-                fallback_msg = "I'm having technical difficulties. Please try again later."
-                self.speak_response(fallback_msg)
+            self.log(f"Error: {e}", "ERROR")
+            self.failures += 1
+            if self.failures >= self.max_failures:
+                self.speak("I'm having technical difficulties. Goodbye.", self.agents.current_agent)
                 return False
-            else:
-                fallback_msg = "Sorry, I encountered an error. Could you try again?"
-                self.speak_response(fallback_msg)
-                return True
-    
-    def speak_response(self, text: str, agent_name: str = "bob"):
-        """Speak response via TTS or print in text mode"""
-        if self.text_mode:
-            return  # Already printed to console
-        
-        try:
-            tts_start = time.time()
-            self.log(f"🎤 Requesting TTS for {agent_name}...")
-            audio_data = self.tts.synthesize(text, agent_name)
-            tts_ms = int((time.time() - tts_start) * 1000)
-            
-            if audio_data:
-                self.log(f"🔊 {agent_name.upper()} Speaking ({tts_ms}ms)...")
-                self.audio.play(audio_data)
-            else:
-                self.log("TTS failed, showing text only", "WARN")
-                
-        except Exception as e:
-            self.log(f"TTS error: {e}", "ERROR")
-            self.log(f"Response text: {text}", "INFO")
-    
+            self.speak("Sorry, I hit an error. Try again?", self.agents.current_agent)
+            return True
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
     def run(self):
-        """Main conversation loop"""
-        print("=" * 70)
-        print("🏠 Bob ↔ Alice Voice Assistant for Home Renovation")
-        print("=" * 70)
-        print(f"\nMode: {'TEXT' if self.text_mode else 'VOICE'}")
-        print(f"Active Agent: BOB (Intake & Planning)\n")
-        print("Commands:")
-        print("  - 'Transfer me to Alice' / 'Let me talk to Alice'")
-        print("  - 'Go back to Bob' / 'Let me talk to Bob'")
-        print("  - 'exit' / 'quit' to end\n")
-        
-        if not self.text_mode:
-            print("🎤 Push-to-talk: Start speaking, then press Ctrl+C when done\n")
-        
-        # Initial greeting
-        greeting = "Hi! I'm Bob, your renovation planning assistant. I'm here to help you think through your project. What room are you looking to renovate?"
+        print("=" * 60)
+        print("🏠  Bob ↔ Alice Voice Assistant for Home Renovation")
+        print("=" * 60)
+        print(f"Mode: {'TEXT' if self.text_mode else 'VOICE (continuous listening)'}")
+        print("Say 'exit' or 'quit' to end the session.\n")
+
+        greeting = (
+            "Hi! I'm Bob, your renovation planning assistant. "
+            "I'm here to help you think through your project. "
+            "What room are you looking to renovate?"
+        )
         self.log(f"🤖 BOB: {greeting}")
-        self.speak_response(greeting, agent_name="bob")
-        
-        # Main loop
+        self.speak(greeting, "bob")
+
         while True:
             try:
-                # Get user input
-                user_input = self.get_user_input()
-                
+                user_input = self.get_input()
                 if user_input is None:
                     continue
-                
-                # Process turn
-                should_continue = self.process_turn(user_input)
-                
-                if not should_continue:
+                if not self.process_turn(user_input):
                     break
-                    
             except KeyboardInterrupt:
-                self.log("\n\nExiting...", "INFO")
+                self.log("Session ended by user.")
                 break
-            except Exception as e:
-                self.log(f"Unexpected error: {e}", "ERROR")
-                break
-        
-        print("\n" + "=" * 70)
+
+        print("\n" + "=" * 60)
         print("👋 Thanks for using Bob & Alice! Good luck with your renovation!")
-        print("=" * 70)
+        print("=" * 60)
 
 
 def main():
-    """Entry point"""
-    load_dotenv()  # 🔥 Load .env from project root
-
-    parser = argparse.ArgumentParser(
-        description="Bob ↔ Alice Voice Assistant for Home Renovation"
-    )
-    parser.add_argument(
-        "--text",
-        action="store_true",
-        help="Use text mode instead of voice (fallback mode)"
-    )
-
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Bob ↔ Alice Voice Assistant")
+    parser.add_argument("--text", action="store_true", help="Text-only mode (no mic)")
     args = parser.parse_args()
-
-    # Initialize and run
-    assistant = VoiceAssistant(text_mode=args.text)
-    assistant.run()
+    VoiceAssistant(text_mode=args.text).run()
 
 
 if __name__ == "__main__":
     main()
-
